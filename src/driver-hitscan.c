@@ -48,13 +48,27 @@ _Static_assert(sizeof(enum hitscan_report_id) == sizeof(uint8_t), "Invalid size"
 enum hitscan_command_id {
 	HITSCAN_CMD_FIRMWARE_VERSION = 0x1,
 	HITSCAN_CMD_SET_DPI = 0x7,
+	/* Same addressing as HITSCAN_CMD_SET_DPI (byte 4 = offset, byte 5 =
+	 * length into the on-device profile), but reads instead of writes.
+	 * There is no read variant of 0x7 itself: a zeroed 0x7 payload
+	 * writes zeros rather than querying anything. */
+	HITSCAN_CMD_READ_PROFILE = 0x8,
 } __attribute__((packed));
 _Static_assert(sizeof(enum hitscan_command_id) == sizeof(uint8_t), "Invalid size");
 
-/* dpi = (raw + 1) * 50, i.e. 50-12800 DPI in steps of 50. */
+/*
+ * dpi = (raw + 1) * step. Byte 8 of the DPI sub-command selects the
+ * step size: 0x00 for 50 DPI steps (50-12800), 0x11 for 100 DPI steps
+ * (100-25600). The profile stores the same V,V,step,checksum layout
+ * that the write command sends, so a read-back decodes the same way.
+ */
 #define HITSCAN_DPI_STEP 50
+#define HITSCAN_DPI_STEP_HIGH 100
+#define HITSCAN_DPI_STEP_SEL_LOW 0x00
+#define HITSCAN_DPI_STEP_SEL_HIGH 0x11
 #define HITSCAN_DPI_MIN HITSCAN_DPI_STEP
-#define HITSCAN_DPI_MAX (256 * HITSCAN_DPI_STEP)
+#define HITSCAN_DPI_LOW_MAX (256 * HITSCAN_DPI_STEP)
+#define HITSCAN_DPI_MAX (256 * HITSCAN_DPI_STEP_HIGH)
 
 /* Every packet is exactly 17 bytes: report id + opcode + 14 bytes of
  * payload + checksum, regardless of opcode. */
@@ -62,7 +76,10 @@ _Static_assert(sizeof(enum hitscan_command_id) == sizeof(uint8_t), "Invalid size
 
 /* The firmware-version response carries a constant 3-byte trailer
  * (offsets 10-12, e.g. "32 01 02") identifying model/major/minor,
- * stored here as a 6-char hex string. */
+ * stored here as a 6-char hex string. Byte 12 has been observed to
+ * differ by link mode (cable vs. dongle) on the same mouse, so it may
+ * be a link indicator rather than a version digit; treated as version
+ * here pending more data. */
 #define HITSCAN_FW_VERSION_LEN 6
 
 /* Checksum: the sum of all 17 bytes (including the checksum byte
@@ -197,6 +214,102 @@ hitscan_get_fw_version(struct ratbag_device *device, char out[HITSCAN_FW_VERSION
 	return 0;
 }
 
+/*
+ * Reads back `length` bytes of the on-device profile starting at
+ * `offset` (opcode 0x8, see HITSCAN_CMD_READ_PROFILE). `length` must
+ * be at most 10, the number of payload bytes a reply carries from
+ * byte 6 onward.
+ */
+static int
+hitscan_read_profile(struct ratbag_device *device, uint8_t offset, uint8_t length, uint8_t out[])
+{
+	int rc = 0;
+	uint8_t buf[HITSCAN_CMD_SIZE] = {
+		HITSCAN_REPORT_ID_CMD, HITSCAN_CMD_READ_PROFILE,
+		0x00, 0x00,
+		offset, length,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, /* checksum, filled by hitscan_query_read() */
+	};
+
+	rc = hitscan_query_read(device, buf, sizeof(buf));
+	if (rc < 0)
+		return rc;
+
+	memcpy(out, &buf[6], length);
+
+	return 0;
+}
+
+/* Report rate lives at profile offset 0x00, one byte, raw = 1000/hz. */
+static int
+hitscan_get_report_rate(struct ratbag_device *device, unsigned int *hz)
+{
+	int rc = 0;
+	uint8_t block[10];
+
+	rc = hitscan_read_profile(device, 0x00, sizeof(block), block);
+	if (rc < 0 || block[0] == 0)
+		return rc < 0 ? rc : -EIO;
+
+	*hz = 1000 / block[0];
+
+	return 0;
+}
+
+static unsigned int
+hitscan_dpi_decode(uint8_t raw, uint8_t step_sel)
+{
+	unsigned int step = step_sel == HITSCAN_DPI_STEP_SEL_HIGH ? HITSCAN_DPI_STEP_HIGH : HITSCAN_DPI_STEP;
+
+	return ((unsigned int)raw + 1) * step;
+}
+
+/*
+ * Picks a step size for a target DPI and returns the raw register
+ * value and step-selector byte. Returns false if dpi does not land on
+ * either step's grid.
+ */
+static bool
+hitscan_dpi_encode(unsigned int dpi, uint8_t *raw_out, uint8_t *step_sel_out)
+{
+	unsigned int step;
+	uint8_t step_sel;
+
+	if (dpi <= HITSCAN_DPI_LOW_MAX) {
+		step = HITSCAN_DPI_STEP;
+		step_sel = HITSCAN_DPI_STEP_SEL_LOW;
+	} else {
+		step = HITSCAN_DPI_STEP_HIGH;
+		step_sel = HITSCAN_DPI_STEP_SEL_HIGH;
+	}
+
+	if (dpi < HITSCAN_DPI_MIN || dpi > HITSCAN_DPI_MAX || (dpi % step) != 0)
+		return false;
+
+	*raw_out = (uint8_t)((dpi / step) - 1);
+	*step_sel_out = step_sel;
+
+	return true;
+}
+
+/* DPI lives at profile offset 0x0a, 2 bytes into the block read from
+ * there (i.e. absolute offset 0x0c), as V,V,step,checksum. */
+static int
+hitscan_get_dpi(struct ratbag_device *device, unsigned int *dpi)
+{
+	int rc = 0;
+	uint8_t block[10];
+
+	rc = hitscan_read_profile(device, 0x0a, sizeof(block), block);
+	if (rc < 0)
+		return rc;
+
+	*dpi = hitscan_dpi_decode(block[2], block[4]);
+
+	return 0;
+}
+
 static int
 hitscan_test_hidraw(struct ratbag_device *device)
 {
@@ -227,10 +340,18 @@ hitscan_probe(struct ratbag_device *device)
 		_cleanup_profile_ struct ratbag_profile *profile = NULL;
 		_cleanup_resolution_ struct ratbag_resolution *resolution = NULL;
 		const unsigned int rates[] = { 125, 250, 500, 1000 };
-		/* Only 0 and 1ms are verified against real hardware; the
-		 * device likely supports more. */
-		const unsigned int debounces[] = { 0, 1 };
-		unsigned int dpis[256];
+		/* 0-1ms are verified against real hardware; 2-7ms come from
+		 * the vendor application's UI (TechPowerUp review of the
+		 * device, which goes up to 8ms), not yet confirmed on the
+		 * wire. Capped at 8 entries, the size of profile->debounces. */
+		const unsigned int debounces[] = { 0, 1, 2, 3, 4, 5, 6, 7 };
+		unsigned int hz = 1000;
+		unsigned int dpi = 800;
+
+		if (hitscan_get_report_rate(device, &hz) < 0)
+			log_debug(device->ratbag, "Couldn't read current report rate, defaulting to %uHz\n", hz);
+		if (hitscan_get_dpi(device, &dpi) < 0)
+			log_debug(device->ratbag, "Couldn't read current DPI, defaulting to %u\n", dpi);
 
 		ratbag_device_init_profiles(device,
 					    1 /* num_profiles */,
@@ -241,7 +362,7 @@ hitscan_probe(struct ratbag_device *device)
 		profile = ratbag_device_get_profile(device, 0);
 		profile->is_active = true;
 		ratbag_profile_set_report_rate_list(profile, rates, ARRAY_LENGTH(rates));
-		profile->hz = 1000;
+		profile->hz = hz;
 		ratbag_profile_set_debounce_list(profile, debounces, ARRAY_LENGTH(debounces));
 		profile->debounce = 0;
 
@@ -249,10 +370,8 @@ hitscan_probe(struct ratbag_device *device)
 		resolution->is_active = true;
 		resolution->is_default = true;
 
-		for (unsigned int i = 0; i < ARRAY_LENGTH(dpis); i++)
-			dpis[i] = (i + 1) * HITSCAN_DPI_STEP;
-		ratbag_resolution_set_dpi_list(resolution, dpis, ARRAY_LENGTH(dpis));
-		ratbag_resolution_set_resolution(resolution, 800, 800);
+		ratbag_resolution_set_dpi_list_from_range(resolution, HITSCAN_DPI_MIN, HITSCAN_DPI_MAX);
+		ratbag_resolution_set_resolution(resolution, dpi, dpi);
 
 		/* Key remapping/macros are not supported by this driver
 		 * yet, so only BUTTON and NONE (disable) are registered. */
@@ -273,28 +392,31 @@ err:
 
 /*
  * Sets DPI:
- *   08 07 00 00 0c 04 [raw] [raw] 00 [chk] 00 00 00 00 00 00 e1
+ *   08 07 00 00 0c 04 [raw] [raw] [step] [chk] 00 00 00 00 00 00 e1
  * Byte 16 is a fixed constant for this sub-command; the checksum is
- * at byte 9 instead. The device echoes the packet back as its
+ * at byte 9 instead. Byte 8 picks the step size (50 or 100 DPI, see
+ * HITSCAN_DPI_STEP_SEL_*); the checksum absorbs the difference so the
+ * rest of the frame, including the trailing e1, does not change
+ * between the two. The device echoes the packet back as its
  * acknowledgment.
  */
 static int
 hitscan_set_dpi(struct ratbag_device *device, unsigned int dpi)
 {
 	int rc = 0;
+	uint8_t raw, step_sel;
 
-	if (dpi < HITSCAN_DPI_MIN || dpi > HITSCAN_DPI_MAX || (dpi % HITSCAN_DPI_STEP) != 0) {
+	if (!hitscan_dpi_encode(dpi, &raw, &step_sel)) {
 		log_error(device->ratbag, "Invalid DPI value %u\n", dpi);
 		return -EINVAL;
 	}
 
-	uint8_t raw = (uint8_t)((dpi / HITSCAN_DPI_STEP) - 1);
 	uint8_t buf[HITSCAN_CMD_SIZE] = {
 		HITSCAN_REPORT_ID_CMD, HITSCAN_CMD_SET_DPI,
 		0x00, 0x00,
 		0x0c, 0x04,
 		raw, raw,
-		0x00,
+		step_sel,
 		0x00, /* checksum, computed below at index 9 */
 		0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 		0xe1, /* fixed trailer for this sub-command */
@@ -351,7 +473,8 @@ hitscan_set_report_rate(struct ratbag_device *device, unsigned int hz)
  * Same opcode family as report rate (byte 5 = 0x02), distinguished by
  * the byte 4 sub-identifier (0xa9 vs rate's 0x00). The value is the
  * debounce time in milliseconds directly, no scaling. Only 0 and 1ms
- * have been tested against real hardware.
+ * have been tested on the wire; the vendor application's UI goes up
+ * to 8ms in 1ms steps (see the debounce list in hitscan_probe()).
  */
 static int
 hitscan_set_debounce(struct ratbag_device *device, unsigned int ms)
